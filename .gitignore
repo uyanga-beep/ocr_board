@@ -1,0 +1,26 @@
+.env
+api.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.xlsx
+.streamlit/secrets.toml
+
+# 이미지 / 결과물 / 런타임
+img/
+work_log.txt
+
+# 테스트 스크립트
+upstage_api_test.py
+upstage_doc_parser_api_test.py
+
+# 이전 모듈 (python_ocr.py로 통합됨)
+env_load.py
+ssl_env.py
+ocr_utils.py
+llm_utils.py
+excel_utils.py
+ocr_prompt.md
