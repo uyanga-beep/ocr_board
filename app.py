@@ -1,6 +1,6 @@
 """건설 현장 동산보드판 OCR — Streamlit UI.
 
-파이프라인: 이미지 업로드 → 흰 박스 크롭 → Upstage OCR → Gemini LLM 구조화 → 엑셀 + 작업로그
+파이프라인: 이미지 업로드 → 흰 박스 크롭 → Gemini Vision(OCR+구조화) → 엑셀 + 작업로그
 """
 
 import os
@@ -9,8 +9,7 @@ from pathlib import Path
 
 import streamlit as st
 
-# Streamlit Cloud: st.secrets → 환경변수로 전달 (.env 없는 환경 대응)
-for _key in ("UPSTAGE_API_KEY", "GEMINI_API_KEY", "UPSTAGE_SSL_VERIFY"):
+for _key in ("GEMINI_API_KEY",):
     if _key not in os.environ:
         try:
             os.environ[_key] = st.secrets[_key]
@@ -22,8 +21,7 @@ from python_ocr import (
     RESULT_DIR,
     append_monthly,
     crop_white_box,
-    llm_structure,
-    ocr_extract,
+    gemini_extract,
     write_work_log,
 )
 
@@ -35,8 +33,8 @@ st.set_page_config(
 
 st.title("건설 현장 동산보드판 OCR")
 st.caption(
-    "「변환 시작」으로 흰 박스 크롭 → OCR → Gemini LLM 구조화까지 실행한 뒤, "
-    "엑셀(.xlsx)을 내려받을 수 있습니다. 결과는 img/result/ 폴더에도 저장됩니다."
+    "「변환 시작」으로 Gemini Vision을 통해 이미지에서 직접 데이터를 추출합니다. "
+    "결과는 엑셀(.xlsx)로 다운로드할 수 있으며, img/result/ 폴더에 월별 누적 저장됩니다."
 )
 
 uploaded_files = st.file_uploader(
@@ -60,18 +58,16 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
 
     results: list[dict] = []
     total = len(uploaded_files)
-    total_ocr_pages = 0
     total_gemini_input = 0
     total_gemini_output = 0
 
     bar = st.progress(0.0, text="처리 준비 중…")
     for i, uf in enumerate(uploaded_files):
         raw = uf.getvalue()
-        max_step = max(total * 3, 1)
+        max_step = max(total * 2, 1)
 
-        # 1) 흰 박스 크롭
         bar.progress(
-            (i * 3) / max_step,
+            (i * 2) / max_step,
             text=f"크롭 ({i + 1}/{total}): {uf.name}",
         )
         try:
@@ -79,34 +75,12 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
         except Exception:
             cropped = raw
 
-        # 2) Upstage OCR
         bar.progress(
-            (i * 3 + 1) / max_step,
-            text=f"OCR ({i + 1}/{total}): {uf.name}",
+            (i * 2 + 1) / max_step,
+            text=f"Gemini Vision ({i + 1}/{total}): {uf.name}",
         )
         try:
-            ocr_text, pages = ocr_extract(cropped, uf.name)
-            total_ocr_pages += pages
-            ocr_error = None
-        except Exception as e:
-            ocr_text = ""
-            ocr_error = str(e)
-            results.append({
-                "name": uf.name,
-                "text": "",
-                "error": ocr_error,
-                "structured": None,
-                "image_bytes": raw,
-            })
-            continue
-
-        # 3) Gemini LLM 구조화
-        bar.progress(
-            (i * 3 + 2) / max_step,
-            text=f"LLM 구조화 ({i + 1}/{total}): {uf.name}",
-        )
-        try:
-            structured = llm_structure(ocr_text)
+            structured = gemini_extract(cropped)
             total_gemini_input += structured.pop("_input_tokens", 0)
             total_gemini_output += structured.pop("_output_tokens", 0)
             s_err = None
@@ -116,8 +90,7 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
 
         results.append({
             "name": uf.name,
-            "text": ocr_text,
-            "error": None,
+            "error": None if structured else s_err,
             "structured": structured,
             "structure_error": s_err,
             "image_bytes": raw,
@@ -125,7 +98,6 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
 
     bar.progress(1.0, text="처리 완료")
 
-    # 월별 엑셀에 누적 저장 (img/result/YYYY-MM.xlsx)
     excel_rows = [
         {
             "filename": r["name"],
@@ -137,10 +109,8 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
     out_path = append_monthly(excel_rows)
     out_name = out_path.name
 
-    # 작업 로그
     write_work_log(
         num_images=total,
-        ocr_pages=total_ocr_pages,
         gemini_input_tokens=total_gemini_input,
         gemini_output_tokens=total_gemini_output,
         output_file=out_name,
@@ -150,11 +120,9 @@ if st.button("변환 시작", type="primary", disabled=not has_files):
     st.session_state["excel_path"] = str(out_path)
     st.session_state["excel_name"] = out_name
 
-    ok = sum(1 for r in results if not r.get("error"))
-    st_ok = sum(1 for r in results if not r.get("error") and r.get("structured"))
+    ok = sum(1 for r in results if r.get("structured"))
     st.session_state["ocr_last_message"] = (
-        f"OCR 성공 {ok}건 / LLM 구조화 {st_ok}건 (전체 {len(results)}건) — "
-        f"결과: img/result/{out_name}"
+        f"Gemini Vision 성공 {ok}건 (전체 {len(results)}건) — 결과: img/result/{out_name}"
     )
 
 # --- 결과 표시 ---
@@ -185,12 +153,5 @@ if results:
                     cols = st.columns(len(REQUIRED_KEYS))
                     for ci, k in enumerate(REQUIRED_KEYS):
                         cols[ci].metric(LABEL_MAP[k], r["structured"].get(k, ""))
-                st.text_area(
-                    "OCR 원문",
-                    value=r.get("text") or "(비어 있음)",
-                    height=120,
-                    key=f"ocr_text_{idx}",
-                    label_visibility="collapsed",
-                )
                 if r.get("structure_error"):
                     st.warning(r["structure_error"])

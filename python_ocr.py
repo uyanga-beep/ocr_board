@@ -1,4 +1,4 @@
-"""img/ 폴더 이미지 → 흰 박스 크롭 → OCR(Upstage) → LLM(Gemini) 구조화 → 엑셀 + 작업로그."""
+"""img/ 폴더 이미지 → 흰 박스 크롭 → Gemini Vision(OCR+구조화) → 엑셀 + 작업로그."""
 
 import base64
 import io
@@ -6,11 +6,14 @@ import json
 import os
 import re
 import ssl
+import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
+import requests as _req
+import urllib3
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XlImage
@@ -18,8 +21,11 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from PIL import Image as PILImage
 from PIL.ExifTags import TAGS, GPSTAGS
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env", override=True)
+
 
 def _env(key: str) -> str:
     v = os.environ.get(key, "").strip()
@@ -28,7 +34,6 @@ def _env(key: str) -> str:
     return v
 
 
-UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 IMG_DIR = ROOT / "img"
 RESULT_DIR = IMG_DIR / "result"
@@ -38,8 +43,8 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # ---------------------------------------------------------------------------
 # 0) 흰 박스(보드판 표) 감지 → 크롭
 # ---------------------------------------------------------------------------
-MIN_AREA_RATIO = 0.03  # 전체 이미지 대비 최소 면적 비율
-MAX_AREA_RATIO = 0.85  # 너무 크면 배경 전체
+MIN_AREA_RATIO = 0.03
+MAX_AREA_RATIO = 0.85
 
 
 def crop_white_box(image_bytes: bytes) -> bytes:
@@ -53,11 +58,8 @@ def crop_white_box(image_bytes: bytes) -> bytes:
     total_area = h * w
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 흰색 영역 추출 (밝은 픽셀 → 이진화)
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-    # 노이즈 제거 후 닫힘 연산으로 흰 영역 합치기
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
 
@@ -70,13 +72,9 @@ def crop_white_box(image_bytes: bytes) -> bytes:
         ratio = area / total_area
         if ratio < MIN_AREA_RATIO or ratio > MAX_AREA_RATIO:
             continue
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        # 사각형(4~6꼭짓점)이거나 boundingRect 근사
         x, y, bw, bh = cv2.boundingRect(cnt)
         rect_area = bw * bh
         fill_ratio = area / rect_area if rect_area > 0 else 0
-        # 직사각형에 가까운지 (면적 채움률 70% 이상)
         if fill_ratio > 0.7 and area > best_area:
             best = (x, y, bw, bh)
             best_area = area
@@ -86,12 +84,9 @@ def crop_white_box(image_bytes: bytes) -> bytes:
         return image_bytes
 
     x, y, bw, bh = best
-    # 약간의 여백 추가
     pad = 5
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(w, x + bw + pad)
-    y2 = min(h, y + bh + pad)
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(w, x + bw + pad), min(h, y + bh + pad)
     cropped = img[y1:y2, x1:x2]
     print(f"   [크롭] 흰 박스 감지: ({x1},{y1})→({x2},{y2}), "
           f"크기 {x2-x1}x{y2-y1} (원본 {w}x{h})")
@@ -101,45 +96,13 @@ def crop_white_box(image_bytes: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# 1) Upstage Document Parse — OCR 텍스트 추출
+# 1) Gemini Vision — 이미지에서 직접 OCR + 구조화 (한 번의 호출)
 # ---------------------------------------------------------------------------
-import requests as _req
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+PROMPT = """너는 건설 현장 데이터 교정 AI야.
+이 사진은 건설 현장 동산보드판이다. 보드판에 적힌 내용을 읽고,
+인식 오류(숫자 오기입, 글자 깨짐)를 문맥에 맞게 수정해.
+특히 건설 전문 용어 사전을 기반으로 오타를 자동으로 교정해.
 
-OCR_URL = "https://api.upstage.ai/v1/document-digitization"
-
-
-def ocr_extract(image_bytes: bytes, filename: str) -> tuple[str, int]:
-    """OCR 텍스트와 사용 페이지 수를 반환."""
-    api_key = UPSTAGE_API_KEY or _env("UPSTAGE_API_KEY")
-    resp = _req.post(
-        OCR_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"document": (filename, image_bytes, "image/jpeg")},
-        data={
-            "model": "document-parse",
-            "ocr": "force",
-            "output_formats": "['text']",
-            "coordinates": "false",
-        },
-        timeout=120,
-        verify=False,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    content = data.get("content", {})
-    pages = data.get("usage", {}).get("pages", 1)
-    text = content.get("text") or content.get("markdown") or ""
-    return text, pages
-
-
-# ---------------------------------------------------------------------------
-# 2) LLM (Gemini) — OCR 텍스트를 건설 보드 JSON으로 구조화
-# ---------------------------------------------------------------------------
-PROMPT = """너는 건설 현장 데이터 교정 AI야. OCR로 추출된 텍스트 중 인식 오류(예: 숫자 오기입, 필체에 따른 글자 깨짐)를 문맥에 맞게 수정하고, 특히 건설 전문 용어 사전을 기반으로 오타를 자동으로 교정해.
-
-다음은 건설 현장 동산보드판에서 OCR로 추출한 원문이다.
 아래 키만 사용하여 JSON 객체 **하나**만 출력해라. 값이 없으면 빈 문자열 ""을 넣어라.
 JSON 바깥에 설명·마크다운·코드펜스를 쓰지 마라.
 
@@ -148,11 +111,6 @@ JSON 바깥에 설명·마크다운·코드펜스를 쓰지 마라.
 - category: 공종
 - location: 위치
 - details: 내용
-
-OCR 원문:
----
-{ocr_text}
----
 """
 
 REQUIRED_KEYS = ("project_name", "category", "location", "details")
@@ -163,16 +121,24 @@ GEMINI_URL = (
 )
 
 
-def llm_structure(ocr_text: str, max_retries: int = 5) -> dict:
-    import time
+def gemini_extract(image_bytes: bytes, max_retries: int = 5) -> dict:
+    """이미지를 Gemini Vision에 보내 OCR+구조화를 한 번에 수행."""
+    api_key = GEMINI_API_KEY or _env("GEMINI_API_KEY")
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
     body = {
-        "contents": [{"parts": [{"text": PROMPT.format(ocr_text=ocr_text or "(빈 텍스트)")}]}],
+        "contents": [{
+            "parts": [
+                {"text": PROMPT},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+            ]
+        }],
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
         },
     }
-    api_key = GEMINI_API_KEY or _env("GEMINI_API_KEY")
+
     for attempt in range(max_retries):
         resp = _req.post(
             GEMINI_URL,
@@ -190,6 +156,7 @@ def llm_structure(ocr_text: str, max_retries: int = 5) -> dict:
         break
     else:
         resp.raise_for_status()
+
     resp_json = resp.json()
     candidate = resp_json["candidates"][0]
     raw = candidate["content"]["parts"][0]["text"].strip()
@@ -209,10 +176,9 @@ def llm_structure(ocr_text: str, max_retries: int = 5) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3-0) 사진 EXIF 메타데이터 추출
+# 2) 사진 EXIF 메타데이터 추출
 # ---------------------------------------------------------------------------
 def _dms_to_decimal(dms, ref: str) -> float:
-    """GPS 도분초(DMS) → 십진 좌표 변환."""
     d, m, s = [float(v) for v in dms]
     dec = d + m / 60 + s / 3600
     if ref in ("S", "W"):
@@ -259,7 +225,6 @@ def extract_exif_meta(image_bytes: bytes) -> dict:
 # ---------------------------------------------------------------------------
 HEADERS = ["사진", "파일명", "수행일시", "촬영일시", "촬영위치", "공사명", "공종", "위치", "내용"]
 DATA_KEYS = ["project_name", "category", "location", "details"]
-META_KEYS = ["added_at", "photo_date", "photo_location"]
 THUMB_MAX = (120, 120)
 ROW_HEIGHT = 95
 THUMBS_DIR = RESULT_DIR / "thumbs"
@@ -275,7 +240,6 @@ def make_thumbnail(image_bytes: bytes) -> bytes:
 
 
 def _monthly_paths() -> tuple[Path, Path]:
-    """현재 월의 엑셀·JSON 경로 반환."""
     month = datetime.now().strftime("%Y-%m")
     return RESULT_DIR / f"{month}.xlsx", RESULT_DIR / f"{month}.json"
 
@@ -323,7 +287,6 @@ def append_monthly(new_rows: list[dict]) -> Path:
 
 
 def _rebuild_excel(entries: list[dict], output_path: Path) -> None:
-    """JSON 데이터 + 저장된 썸네일로 엑셀을 처음부터 생성."""
     wb = Workbook()
     ws = wb.active
     ws.title = "동산보드 OCR 결과"
@@ -338,11 +301,11 @@ def _rebuild_excel(entries: list[dict], output_path: Path) -> None:
         cell.font = header_font
         cell.alignment = header_align
 
-    ws.column_dimensions["A"].width = 18   # 사진
-    ws.column_dimensions["B"].width = 14   # 파일명
-    ws.column_dimensions["C"].width = 20   # 수행일시
-    ws.column_dimensions["D"].width = 20   # 촬영일시
-    ws.column_dimensions["E"].width = 24   # 촬영위치
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 24
     for col_letter in ("F", "G", "H", "I"):
         ws.column_dimensions[col_letter].width = 28
 
@@ -375,52 +338,37 @@ def _rebuild_excel(entries: list[dict], output_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 메인
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # 4) 작업 로그 — work_log.txt 누적 기록
 # ---------------------------------------------------------------------------
-UPSTAGE_OCR_PRICE_PER_PAGE = 0.01        # USD
-GEMINI_INPUT_PRICE_PER_1M  = 0.15        # USD (gemini-2.5-flash input)
-GEMINI_OUTPUT_PRICE_PER_1M = 0.60        # USD (gemini-2.5-flash output)
+GEMINI_INPUT_PRICE_PER_1M = 0.15
+GEMINI_OUTPUT_PRICE_PER_1M = 0.60
 
 
 def write_work_log(
     num_images: int,
-    ocr_pages: int,
     gemini_input_tokens: int,
     gemini_output_tokens: int,
     output_file: str,
 ) -> None:
-    ocr_cost = ocr_pages * UPSTAGE_OCR_PRICE_PER_PAGE
     gemini_input_cost = gemini_input_tokens / 1_000_000 * GEMINI_INPUT_PRICE_PER_1M
     gemini_output_cost = gemini_output_tokens / 1_000_000 * GEMINI_OUTPUT_PRICE_PER_1M
-    gemini_cost = gemini_input_cost + gemini_output_cost
-    total_cost = ocr_cost + gemini_cost
+    total_cost = gemini_input_cost + gemini_output_cost
 
     log_path = RESULT_DIR / "work_log.txt"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    ocr_model = "document-parse"
-    llm_model = GEMINI_URL.split("/models/")[1].split(":")[0]
+    model = GEMINI_URL.split("/models/")[1].split(":")[0]
 
     entry = (
         f"{'=' * 60}\n"
         f"실행 일시       : {now}\n"
         f"처리 사진 수    : {num_images}장\n"
         f"출력 파일       : {output_file}\n"
-        f"─── OCR (Upstage) ───\n"
-        f"  모델          : {ocr_model}\n"
-        f"  페이지 수     : {ocr_pages}\n"
-        f"  비용          : ${ocr_cost:.4f}\n"
-        f"─── LLM (Gemini) ───\n"
-        f"  모델          : {llm_model}\n"
+        f"─── Gemini Vision (OCR + 구조화) ───\n"
+        f"  모델          : {model}\n"
         f"  입력 토큰     : {gemini_input_tokens:,}\n"
         f"  출력 토큰     : {gemini_output_tokens:,}\n"
         f"  합계 토큰     : {gemini_input_tokens + gemini_output_tokens:,}\n"
-        f"  비용          : ${gemini_cost:.6f}\n"
-        f"─── 합계 ───\n"
-        f"  예상 총 비용  : ${total_cost:.4f}\n"
+        f"  예상 비용     : ${total_cost:.6f}\n"
         f"{'=' * 60}\n\n"
     )
 
@@ -440,7 +388,6 @@ if __name__ == "__main__":
     print(f"이미지 {len(images)}장 발견: {[f.name for f in images]}\n")
 
     rows = []
-    total_ocr_pages = 0
     total_gemini_input = 0
     total_gemini_output = 0
 
@@ -451,14 +398,8 @@ if __name__ == "__main__":
         print("   흰 박스 크롭 중...")
         cropped = crop_white_box(img_bytes)
 
-        print("   OCR 추출 중...")
-        ocr_text, pages = ocr_extract(cropped, img_path.name)
-        total_ocr_pages += pages
-        safe = ocr_text.encode("utf-8", errors="replace").decode("utf-8")
-        print(f"   OCR 결과 ({len(ocr_text)}자, {pages}페이지): {safe[:120]}...")
-
-        print("   LLM 구조화 중...")
-        structured = llm_structure(ocr_text)
+        print("   Gemini Vision 분석 중...")
+        structured = gemini_extract(cropped)
         total_gemini_input += structured.pop("_input_tokens", 0)
         total_gemini_output += structured.pop("_output_tokens", 0)
         for k in REQUIRED_KEYS:
@@ -479,7 +420,6 @@ if __name__ == "__main__":
 
     write_work_log(
         num_images=len(images),
-        ocr_pages=total_ocr_pages,
         gemini_input_tokens=total_gemini_input,
         gemini_output_tokens=total_gemini_output,
         output_file=out_path.name,
